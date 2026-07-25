@@ -1,9 +1,17 @@
 ---
 # Configure Splunk server certificate from operator-mounted TLS secret.
 # Input: /mnt/tls/splunk-server-tls-cert/{tls.crt, tls.key[, ca.crt]}
+#        or, for a CA-only secret (server role used purely to distribute a
+#        trust anchor), /mnt/tls/splunk-server-tls-cert/{ca.crt} alone.
 # Output: bundled PEM at /opt/splunk/etc/auth/splunk-server-bundle.pem
+#         (skipped when tls.crt/tls.key are absent)
 #         CA at /opt/splunk/etc/auth/splunk-server-ca.pem
 #         server.conf [sslConfig] configured
+
+- name: Check if tls.crt is present in server cert mount
+  stat:
+    path: /mnt/tls/splunk-server-tls-cert/tls.crt
+  register: server_tls_file
 
 - name: Generate ephemeral SSL passphrase
   command: >
@@ -12,6 +20,7 @@
   register: ssl_passphrase
   changed_when: false
   no_log: true
+  when: server_tls_file.stat.exists
 
 - name: Ensure Splunk auth directory exists
   file:
@@ -22,6 +31,7 @@
     mode: '0700'
   become: yes
   become_user: "{{ splunk.user }}"
+  when: server_tls_file.stat.exists
 
 - name: Write cert bundle script
   copy:
@@ -55,6 +65,7 @@
               f.write(b'\n')
           f.write(enc_key_pem)
     mode: '0700'
+  when: server_tls_file.stat.exists
 
 - name: Encrypt private key and build server cert bundle
   command: >
@@ -63,6 +74,7 @@
   become: yes
   become_user: "{{ splunk.user }}"
   no_log: true
+  when: server_tls_file.stat.exists
 
 - name: Set bundle permissions
   file:
@@ -72,6 +84,7 @@
     mode: '0600'
   become: yes
   become_user: "{{ splunk.user }}"
+  when: server_tls_file.stat.exists
 
 - name: Check if ca.crt is present in server cert mount
   stat:
@@ -93,7 +106,10 @@
       # present locally in sslRootCAPath -- it does not complete the chain
       # using intermediates presented by the peer during the handshake.
       # Assemble tls.crt's non-leaf certs + ca.crt into one deduplicated
-      # trust bundle.
+      # trust bundle. tls.crt is absent for a CA-only secret (server role
+      # used purely to distribute a trust anchor) -- in that case ca.crt
+      # alone becomes the bundle.
+      import os
       import sys
 
       tls_crt_path = '/mnt/tls/splunk-server-tls-cert/tls.crt'
@@ -114,9 +130,11 @@
                   current.append(line)
           return certs
 
-      with open(tls_crt_path, 'rb') as f:
-          tls_certs = split_pem_certs(f.read())
-      chain_certs = tls_certs[1:]  # drop the leaf; keep any presented intermediates/root
+      chain_certs = []
+      if os.path.exists(tls_crt_path):
+          with open(tls_crt_path, 'rb') as f:
+              tls_certs = split_pem_certs(f.read())
+          chain_certs = tls_certs[1:]  # drop the leaf; keep any presented intermediates/root
 
       with open(ca_crt_path, 'rb') as f:
           ca_certs = split_pem_certs(f.read())
@@ -170,6 +188,7 @@
     group: "{{ splunk.group }}"
   become: yes
   become_user: "{{ splunk.user }}"
+  when: server_tls_file.stat.exists
 
 - name: Configure sslPassword in server.conf
   ini_file:
@@ -183,6 +202,7 @@
   become_user: "{{ splunk.user }}"
   no_log: true
   changed_when: false
+  when: server_tls_file.stat.exists
 
 - name: Configure sslRootCAPath in server.conf
   ini_file:
